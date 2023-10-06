@@ -1067,7 +1067,7 @@ sockopt_impl!(
     SetOnly,
     libc::SOL_NETLINK,
     libc::NETLINK_ADD_MEMBERSHIP,
-    libc::c_uint
+    libc::c_int
 );
 #[cfg(any(target_os = "android", target_os = "linux"))]
 sockopt_impl!(
@@ -1076,7 +1076,7 @@ sockopt_impl!(
     SetOnly,
     libc::SOL_NETLINK,
     libc::NETLINK_DROP_MEMBERSHIP,
-    libc::c_uint
+    libc::c_int
 );
 #[cfg(any(target_os = "android", target_os = "linux"))]
 sockopt_impl!(
@@ -1146,42 +1146,75 @@ sockopt_impl!(
 /// The returned Vec contains a bit set in chunks of u32.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 #[derive(Copy, Clone, Debug)]
-pub struct NetlinkListMemberships;
+pub struct NetlinkListMemberships<T>(::std::marker::PhantomData<T>);
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-impl GetSockOpt for NetlinkListMemberships {
-    type Val = Vec<u32>;
+impl<T> Default for NetlinkListMemberships<T> {
+    fn default() -> Self {
+        NetlinkListMemberships(Default::default())
+    }
+}
 
-    fn get(&self, fd: RawFd) -> Result<Self::Val> {
+// trait AsMutPtr {
+//     type Ptr;
+//     fn as_mut_ptr(&mut self) -> Self::Ptr;
+// }
+
+trait ToRawPtr {
+    type Output;
+    fn to_raw_ptr(&self) -> *mut Self::Output;
+}
+
+
+impl<T> ToRawPtr for [T] {
+    type Output = T;
+    fn to_raw_ptr(&self) -> *mut Self::Output {
+        self.as_ptr() as *mut T
+    }
+}
+
+impl<T, const N: usize> ToRawPtr for [T; N] {
+    type Output = T;
+    fn to_raw_ptr(&self) -> *mut Self::Output {
+        self.as_ptr() as *mut T
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+impl<T> GetSockOpt for NetlinkListMemberships<T>
+where
+    T: AsRef<[u32]> + Copy + Default + ToRawPtr,
+{
+    type Val = T;
+
+    fn get<F: AsFd>(&self, fd: &F) -> Result<Self::Val> {
         let mut len = 0;
         unsafe {
             // Get membership length
             let res = libc::getsockopt(
-                fd,
+                fd.as_fd().as_raw_fd(),
                 libc::SOL_NETLINK,
                 libc::NETLINK_LIST_MEMBERSHIPS,
                 ::std::ptr::null_mut(),
                 &mut len,
             );
             Errno::result(res)?;
-            let mut val = vec![0u32; (len as usize) / mem::size_of::<u32>()];
-            if val.capacity() > 0 {
-                let old_len = len;
-                let res = libc::getsockopt(
-                    fd,
-                    libc::SOL_NETLINK,
-                    libc::NETLINK_LIST_MEMBERSHIPS,
-                    val.as_mut_ptr() as *mut libc::c_void,
-                    &mut len,
-                );
-                if old_len != len {
-                    Err(Errno::from_i32(libc::EIO))
-                } else {
-                    Errno::result(res).and(Ok(val))
-                }
-            } else {
-                Ok(val)
+            let v: T = Default::default();
+            // let raw_ptr = v.to_raw_ptr();
+            let old_len = len;
+            let res = libc::getsockopt(
+                fd.as_fd().as_raw_fd(),
+                libc::SOL_NETLINK,
+                libc::NETLINK_LIST_MEMBERSHIPS,
+                // v.as_mut_ptr() as *mut libc::c_void,
+                // raw_ptr as *mut libc::c_void,
+                v.to_raw_ptr() as *mut libc::c_void,
+                &mut len,
+            );
+            if old_len != len {
+                return Err(Errno::from_i32(libc::EIO));
             }
+            Errno::result(res).and(Ok(v))
         }
     }
 }
@@ -1620,23 +1653,27 @@ mod test {
             return;
         }
 
-        let s = s.unwrap();
+        let binding = s.unwrap();
+        let s = binding.as_fd();
 
-        let groups = || -> Result<Vec<u32>> {
-            setsockopt(s, super::NetlinkAddMembership, &22)?;
-            setsockopt(s, super::NetlinkAddMembership, &27)?;
-            getsockopt(s, super::NetlinkListMemberships)
-        }();
+        setsockopt(&s, super::NetlinkAddMembership, &22).unwrap();
+        setsockopt(&s, super::NetlinkAddMembership, &27).unwrap();
+
+        let opt = super::NetlinkListMemberships::<[u32; 10]>::default();
+
+        let groups = getsockopt(&s, opt);
 
         let groups = match groups {
             Err(Errno::ENOPROTOOPT) | Err(Errno::EOPNOTSUPP) => return,
             _ => groups.unwrap(),
         };
 
+        assert!(groups[0] & (1 << 20) == 0);
         assert!(groups[0] & (1 << 21) != 0);
+        assert!(groups[0] & (1 << 22) == 0);
         assert!(groups[0] & (1 << 26) != 0);
 
-        close(s).unwrap();
+        close(s.as_raw_fd()).unwrap();
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1656,17 +1693,18 @@ mod test {
             return;
         }
 
-        let s = s.unwrap();
+        let binding = s.unwrap();
+        let s = binding.as_fd();
 
-        let groups = getsockopt(s, super::NetlinkListMemberships);
+        let groups = getsockopt(&s, super::NetlinkListMemberships::<[u32; 0]>::default());
 
         let groups = match groups {
             Err(Errno::ENOPROTOOPT) | Err(Errno::EOPNOTSUPP) => return,
             _ => groups.unwrap(),
         };
 
-        assert!(groups.capacity() == 0);
+        assert!(groups.len() == 0);
 
-        close(s).unwrap();
+        close(s.as_raw_fd()).unwrap();
     }
 }
